@@ -3,19 +3,17 @@ package commands
 import (
 	"fmt"
 
-	"net/http"
-
-	"github.com/cloudfoundry-incubator/credhub-cli/actions"
 	"github.com/cloudfoundry-incubator/credhub-cli/client"
 	"github.com/cloudfoundry-incubator/credhub-cli/config"
-	"github.com/cloudfoundry-incubator/credhub-cli/repositories"
 
 	"bufio"
 	"os"
 	"strings"
 
+	"github.com/cloudfoundry-incubator/credhub-cli/credhub"
+	"github.com/cloudfoundry-incubator/credhub-cli/credhub/credentials"
+	"github.com/cloudfoundry-incubator/credhub-cli/credhub/credentials/values"
 	"github.com/cloudfoundry-incubator/credhub-cli/errors"
-	"github.com/cloudfoundry-incubator/credhub-cli/models"
 	"github.com/cloudfoundry-incubator/credhub-cli/util"
 )
 
@@ -50,25 +48,38 @@ func (cmd SetCommand) Execute([]string) error {
 	}
 
 	cfg := config.ReadConfig()
-	repository := repositories.NewCredentialRepository(client.NewHttpClient(cfg))
 
-	action := actions.NewAction(repository, &cfg)
-	request, err := MakeRequest(cmd, cfg)
+	var credhubClient *credhub.CredHub
+
+	if clientCredentialsInEnvironment() {
+		credhubClient, err = newCredhubClient(&cfg, os.Getenv("CREDHUB_CLIENT"), os.Getenv("CREDHUB_SECRET"), true)
+	} else {
+		credhubClient, err = newCredhubClient(&cfg, config.AuthClient, config.AuthPassword, false)
+	}
 	if err != nil {
 		return err
 	}
 
-	credential, err := action.DoAction(request, cmd.CredentialIdentifier)
+	err = config.ValidateConfig(cfg)
+	if err != nil {
+		if !clientCredentialsInEnvironment() {
+			return err
+		}
+	}
+
+	credential, err := MakeRequest(cmd, cfg, credhubClient)
 	if err != nil {
 		return err
 	}
-	models.Println(credential, cmd.OutputJson)
+
+	printCredential(cmd.OutputJson, credential)
 
 	return nil
 }
 
-func MakeRequest(cmd SetCommand, config config.Config) (*http.Request, error) {
-	var request *http.Request
+func MakeRequest(cmd SetCommand, config config.Config, credhubClient *credhub.CredHub) (interface{}, error) {
+	var output interface{}
+
 	if cmd.Type == "ssh" || cmd.Type == "rsa" {
 		var err error
 
@@ -102,8 +113,16 @@ func MakeRequest(cmd SetCommand, config config.Config) (*http.Request, error) {
 		}
 
 		request = client.NewSetCertificateRequest(config, cmd.CredentialIdentifier, root, cmd.CaName, certificate, privateKey, !cmd.NoOverwrite)
+
 	} else if cmd.Type == "user" {
-		request = client.NewSetUserRequest(config, cmd.CredentialIdentifier, cmd.Username, cmd.Password, !cmd.NoOverwrite)
+		value := values.User{
+			cmd.Username,
+			cmd.Password,
+		}
+		var userCredential credentials.User
+		userCredential, err = credhubClient.SetUser(cmd.CredentialIdentifier, value, !cmd.NoOverwrite)
+		output = interface{}(userCredential)
+
 	} else if cmd.Type == "password" {
 		request = client.NewSetCredentialRequest(config, cmd.Type, cmd.CredentialIdentifier, cmd.Password, !cmd.NoOverwrite)
 	} else if cmd.Type == "json" {
@@ -112,7 +131,11 @@ func MakeRequest(cmd SetCommand, config config.Config) (*http.Request, error) {
 		request = client.NewSetCredentialRequest(config, cmd.Type, cmd.CredentialIdentifier, cmd.Value, !cmd.NoOverwrite)
 	}
 
-	return request, nil
+	if err != nil {
+		return nil, err
+	}
+
+	return output, nil
 }
 
 func promptForInput(prompt string, value *string) {
